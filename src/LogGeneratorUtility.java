@@ -1,191 +1,98 @@
-import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.Random;
 import java.util.Scanner;
 
-/**
- * Utility to generate test log entries and append them to the log file.
- * Useful for simulating live trading logs for testing the analyzer.
- */
+/** Appends synthetic records for a local demonstration. */
 public class LogGeneratorUtility {
-    private static final DateTimeFormatter FORMATTER = 
-        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    
-    private static final String[] INFO_CODES = {
-        "TRADE_STARTED", "CONNECTION_OK", "TRADE_EXECUTED", 
-        "RECONNECTED", "RECOVERY_STARTED", "SYSTEM_ONLINE", "MARKET_CLOSE"
+    private static final String[] LEVELS = {"INFO", "WARN", "ERROR", "FATAL"};
+    private static final String[][] CODES = {
+        {"TRADE_STARTED", "CONNECTION_OK", "TRADE_EXECUTED", "RECONNECTED", "RECOVERY_STARTED", "SYSTEM_ONLINE", "MARKET_CLOSE"},
+        {"LATENCY_HIGH", "DATABASE_SLOW", "LOW_BALANCE", "RATE_LIMIT_WARNING"},
+        {"CONNECTION_DROPPED", "TRADE_REJECTED", "DATABASE_ERROR", "AUTHENTICATION_FAILED", "TIMEOUT_EXCEEDED"},
+        {"SYSTEM_DOWN", "CRITICAL_ERROR", "DATA_CORRUPTION"}
     };
-    
-    private static final String[] WARN_CODES = {
-        "LATENCY_HIGH", "DATABASE_SLOW", "LOW_BALANCE", "RATE_LIMIT_WARNING"
-    };
-    
-    private static final String[] ERROR_CODES = {
-        "CONNECTION_DROPPED", "TRADE_REJECTED", "DATABASE_ERROR", 
-        "AUTHENTICATION_FAILED", "TIMEOUT_EXCEEDED"
-    };
-    
-    private static final String[] FATAL_CODES = {
-        "SYSTEM_DOWN", "CRITICAL_ERROR", "DATA_CORRUPTION"
-    };
-    
-    private static final String[] MESSAGES = {
-        "Operation completed",
-        "Transaction pending",
-        "Retry mechanism engaged",
-        "Request timeout",
-        "Service unavailable",
-        "Resource exhausted",
-        "Invalid parameters",
-        "Insufficient permissions",
-        "Cache miss detected",
-        "Network error occurred"
-    };
+    private final String path;
+    private final Random random = new Random();
 
-    private final String logFilePath;
-    private final Random random;
+    public LogGeneratorUtility(String path) { this.path = path; }
 
-    public LogGeneratorUtility(String logFilePath) {
-        this.logFilePath = logFilePath;
-        this.random = new Random();
-    }
-
-    /**
-     * Generates a random log entry
-     */
-    private String generateLogEntry() {
-        LocalDateTime now = LocalDateTime.now();
-        String timestamp = now.format(FORMATTER);
-        
-        // Randomly select severity level
-        int severityChoice = random.nextInt(100);
-        String level, code;
-        
-        if (severityChoice < 50) {
-            level = "INFO";
-            code = INFO_CODES[random.nextInt(INFO_CODES.length)];
-        } else if (severityChoice < 80) {
-            level = "WARN";
-            code = WARN_CODES[random.nextInt(WARN_CODES.length)];
-        } else if (severityChoice < 95) {
-            level = "ERROR";
-            code = ERROR_CODES[random.nextInt(ERROR_CODES.length)];
-        } else {
-            level = "FATAL";
-            code = FATAL_CODES[random.nextInt(FATAL_CODES.length)];
-        }
-        
-        String message = MESSAGES[random.nextInt(MESSAGES.length)];
-        
-        return String.format("[%s] %s - %s: %s", timestamp, level, code, message);
-    }
-
-    /**
-     * Appends a single log entry to the file
-     */
     public void appendLogEntry(String entry) throws IOException {
-        try (FileWriter writer = new FileWriter(logFilePath, true)) {
-            writer.write(entry + "\n");
-            writer.flush();
-        }
+        Files.write(Paths.get(path), (entry + "\n").getBytes(StandardCharsets.UTF_8),
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
-    /**
-     * Generates and appends a random log entry
-     */
     public void appendRandomEntry() throws IOException {
-        String entry = generateLogEntry();
+        int roll = random.nextInt(100);
+        int level = roll < 50 ? 0 : roll < 80 ? 1 : roll < 95 ? 2 : 3;
+        String code = CODES[level][random.nextInt(CODES[level].length)];
+        String entry = new LogEntry(LocalDateTime.now(), LEVELS[level], code, "Synthetic trade event").toString();
         appendLogEntry(entry);
-        System.out.println("Added: " + entry);
+        System.out.println(entry);
     }
 
-    /**
-     * Continuously generates log entries at specified interval
-     */
-    public void startContinuousGeneration(long intervalMs, int count) {
-        System.out.println("Starting log generation: " + count + " entries, interval: " + intervalMs + "ms");
-        
+    public void startContinuousGeneration(long intervalMs, int count) throws IOException, InterruptedException {
+        if (intervalMs < 0 || count < 0) throw new IllegalArgumentException("Count and interval must be non-negative");
         for (int i = 0; i < count; i++) {
-            try {
-                appendRandomEntry();
-                Thread.sleep(intervalMs);
-            } catch (IOException e) {
-                System.err.println("Error writing to log file: " + e.getMessage());
-                break;
-            } catch (InterruptedException e) {
-                System.err.println("Log generation interrupted");
-                Thread.currentThread().interrupt();
-                break;
-            }
+            appendRandomEntry();
+            if (i + 1 < count) Thread.sleep(intervalMs);
         }
-        
-        System.out.println("Log generation completed");
     }
 
-    /**
-     * Interactive menu for log generation
-     */
-    public void interactiveMode() {
-        Scanner scanner = new Scanner(System.in);
-        boolean running = true;
-
-        while (running) {
-            System.out.println("\n--- LOG GENERATOR UTILITY ---");
-            System.out.println("1. Add single random log entry");
-            System.out.println("2. Add multiple entries with interval");
-            System.out.println("3. Exit");
-            System.out.print("Select option: ");
-
+    public void interactiveMode() throws IOException, InterruptedException {
+        Scanner input = new Scanner(System.in);
+        while (true) {
+            System.out.print("\n1. Append one entry\n2. Append multiple entries\n3. Exit\n> ");
+            if (!input.hasNextLine()) return;
             try {
-                String choice = scanner.nextLine().trim();
-
-                switch (choice) {
+                switch (input.nextLine().trim()) {
                     case "1":
                         appendRandomEntry();
                         break;
                     case "2":
-                        System.out.print("Number of entries: ");
-                        int count = Integer.parseInt(scanner.nextLine().trim());
-                        System.out.print("Interval in milliseconds: ");
-                        long interval = Long.parseLong(scanner.nextLine().trim());
+                        System.out.print("Count: ");
+                        if (!input.hasNextLine()) return;
+                        int count = Integer.parseInt(input.nextLine().trim());
+                        System.out.print("Interval (ms): ");
+                        if (!input.hasNextLine()) return;
+                        long interval = Long.parseLong(input.nextLine().trim());
                         startContinuousGeneration(interval, count);
                         break;
                     case "3":
-                        running = false;
-                        System.out.println("Exiting log generator");
-                        break;
+                        return;
                     default:
-                        System.out.println("Invalid option");
-                        break;
+                        System.out.println("Use 1-3.");
                 }
-            } catch (NumberFormatException e) {
-                System.err.println("Invalid input format");
-            } catch (IOException e) {
-                System.err.println("Error: " + e.getMessage());
+            } catch (IllegalArgumentException e) {
+                System.err.println(e.getMessage());
             }
         }
-
-        scanner.close();
     }
 
-    /**
-     * Main entry point
-     */
     public static void main(String[] args) {
-        String logFilePath = args.length > 0 ? args[0] : "trade_log.txt";
-        
-        LogGeneratorUtility generator = new LogGeneratorUtility(logFilePath);
-        
-        if (args.length > 1 && args[1].equals("--auto")) {
-            // Auto mode: generate entries and exit
-            int count = args.length > 2 ? Integer.parseInt(args[2]) : 5;
-            long interval = args.length > 3 ? Long.parseLong(args[3]) : 2000;
-            generator.startContinuousGeneration(interval, count);
-        } else {
-            // Interactive mode
-            generator.interactiveMode();
+        try {
+            LogGeneratorUtility generator = new LogGeneratorUtility(args.length > 0 ? args[0] : "trade_log.txt");
+            if (args.length <= 1) {
+                generator.interactiveMode();
+            } else {
+                if (!args[1].equals("--auto") || args.length > 4) {
+                    throw new IllegalArgumentException("Usage: LogGeneratorUtility [path [--auto [count [intervalMs]]]]");
+                }
+                int count = args.length > 2 ? Integer.parseInt(args[2]) : 5;
+                long interval = args.length > 3 ? Long.parseLong(args[3]) : 2000;
+                generator.startContinuousGeneration(interval, count);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("Generation interrupted");
+            System.exit(1);
+        } catch (IOException | IllegalArgumentException e) {
+            System.err.println(e.getMessage());
+            System.exit(1);
         }
     }
 }

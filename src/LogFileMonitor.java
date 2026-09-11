@@ -1,225 +1,140 @@
-import java.io.*;
-import java.nio.file.*;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.HashSet;
+import java.util.Arrays;
+import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 
-/**
- * Monitors a log file continuously and triggers alerts for error codes.
- * Uses BufferedReader for efficient reading and supports growing files.
- */
+/** Polls complete UTF-8 lines, retaining the offset of an incomplete trailing line. */
 public class LogFileMonitor implements Runnable {
-    private final String logFilePath;
-    private final AlertDispatcher alertDispatcher;
-    private final LogParser logParser;
-    private final Set<String> trackedErrorCodes;
+    private final Path path;
+    private final AlertDispatcher dispatcher;
+    private final LogParser parser = new LogParser();
+    private final Set<String> tracked = ConcurrentHashMap.newKeySet();
+    private final CountDownLatch initialRead = new CountDownLatch(1);
     private volatile boolean running;
-    private Thread monitorThread;
-    private long lastReadPosition;
-    private final CountDownLatch initialReadComplete;
+    private volatile long lastReadPosition;
+    private Object fileKey;
+    private byte[] prefix = new byte[0];
+    private Thread worker;
 
     public LogFileMonitor(String logFilePath, AlertDispatcher alertDispatcher) {
-        this.logFilePath = logFilePath;
-        this.alertDispatcher = alertDispatcher;
-        this.logParser = new LogParser();
-        this.trackedErrorCodes = new HashSet<>();
-        this.running = false;
-        this.lastReadPosition = 0;
-        this.initialReadComplete = new CountDownLatch(1);
+        path = Paths.get(logFilePath);
+        dispatcher = Objects.requireNonNull(alertDispatcher);
     }
 
-    /**
-     * Adds an error code to track
-     */
-    public void trackErrorCode(String errorCode) {
-        trackedErrorCodes.add(errorCode);
-        System.out.println("Now tracking error code: " + errorCode);
+    private String normalize(String code) {
+        String value = Objects.requireNonNull(code, "errorCode").trim().toUpperCase(Locale.ROOT);
+        if (!value.matches("[A-Z][A-Z0-9_]*"))
+            throw new IllegalArgumentException("Use letters, digits and underscores; start with a letter");
+        return value;
     }
 
-    /**
-     * Removes an error code from tracking
-     */
-    public void untrackErrorCode(String errorCode) {
-        trackedErrorCodes.remove(errorCode);
-    }
+    public void trackErrorCode(String code) { tracked.add(normalize(code)); }
+    public void untrackErrorCode(String code) { tracked.remove(normalize(code)); }
 
-    /**
-     * Starts the log file monitoring thread
-     */
     public synchronized void start() {
-        if (running) {
-            System.out.println("LogFileMonitor is already running");
-            return;
-        }
-
-        // Verify file exists
-        File file = new File(logFilePath);
-        if (!file.exists()) {
-            System.err.println("Error: Log file does not exist: " + logFilePath);
-            return;
-        }
-
+        if (worker != null) return;
+        if (!Files.isRegularFile(path)) throw new IllegalArgumentException("Log file not found: " + path);
         running = true;
-        monitorThread = new Thread(this, "LogFileMonitor-Thread");
-        monitorThread.setDaemon(false);
-        monitorThread.start();
-        System.out.println("LogFileMonitor started, monitoring: " + logFilePath);
+        worker = new Thread(this, "LogFileMonitor-Thread");
+        worker.start();
     }
 
-    /**
-     * Stops the log file monitoring thread
-     */
-    public synchronized void stop() {
-        if (!running) {
-            System.out.println("LogFileMonitor is not running");
-            return;
+    public void stop() {
+        Thread thread;
+        synchronized (this) {
+            running = false;
+            thread = worker;
+            if (thread != null) thread.interrupt();
         }
-
-        running = false;
-        try {
-            if (monitorThread != null) {
-                monitorThread.join(5000); // Wait max 5 seconds
-            }
-        } catch (InterruptedException e) {
-            System.err.println("Interrupted while stopping LogFileMonitor");
-            Thread.currentThread().interrupt();
+        if (thread == null || thread == Thread.currentThread()) return;
+        boolean interrupted = false;
+        while (thread.isAlive()) {
+            try { thread.join(); }
+            catch (InterruptedException e) { interrupted = true; }
         }
-        System.out.println("LogFileMonitor stopped");
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
-    /**
-     * Main monitoring loop
-     */
     @Override
     public void run() {
-        System.out.println("Log File Monitor thread started");
-
         try {
-            // Initial read of existing content
-            processLogFile();
-            initialReadComplete.countDown();
-
-            // Keep monitoring for new content
             while (running) {
-                try {
-                    Thread.sleep(1000); // Check every second
-                    processLogFile();
-                } catch (InterruptedException e) {
-                    if (running) {
-                        System.err.println("LogFileMonitor interrupted");
-                        Thread.currentThread().interrupt();
-                    }
-                    break;
-                }
+                try { processLogFile(); }
+                catch (IOException e) {
+                    System.err.println("Cannot read log; retrying: " + e.getMessage());
+                } finally { initialRead.countDown(); }
+                try { Thread.sleep(1000); }
+                catch (InterruptedException e) { break; }
             }
-
-        } catch (IOException e) {
-            System.err.println("Error in LogFileMonitor: " + e.getMessage());
-            e.printStackTrace();
         } finally {
-            initialReadComplete.countDown();
-            System.out.println("Log File Monitor thread stopped");
+            running = false;
+            initialRead.countDown();
         }
     }
 
-    /**
-     * Waits until the initial contents of the log file have been processed.
-     */
     public void awaitInitialRead() {
-        try {
-            initialReadComplete.await();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        try { initialRead.await(); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
-    /**
-     * Processes the log file - reads new lines and checks for errors
-     */
-    private void processLogFile() throws IOException {
-        File file = new File(logFilePath);
-
-        if (!file.exists()) {
-            System.err.println("Log file no longer exists: " + logFilePath);
-            return;
-        }
-
-        if (file.length() < lastReadPosition) {
+    // Package-private for deterministic integration tests without timing-based sleeps.
+    void processLogFile() throws IOException {
+        BasicFileAttributes attributes = Files.readAttributes(path, BasicFileAttributes.class);
+        Object currentKey = attributes.fileKey();
+        if ((fileKey != null && currentKey != null && !fileKey.equals(currentKey))
+                || attributes.size() < lastReadPosition) {
             lastReadPosition = 0;
         }
-
-        try (RandomAccessFile reader = new RandomAccessFile(file, "r")) {
+        fileKey = currentKey;
+        try (RandomAccessFile reader = new RandomAccessFile(path.toFile(), "r")) {
+            // ponytail: prefix fallback misses identical-prefix replacements; use OS file identity for stronger rotation guarantees.
+            if (lastReadPosition > 0 && prefix.length > 0) {
+                byte[] currentPrefix = new byte[prefix.length];
+                int count = reader.read(currentPrefix);
+                if (count != prefix.length || !Arrays.equals(prefix, currentPrefix)) lastReadPosition = 0;
+            }
             reader.seek(lastReadPosition);
-
-            String line;
-            while ((line = reader.readLine()) != null && running) {
-                try {
-                    processingLogLine(new String(line.getBytes("ISO-8859-1"), "UTF-8"));
-                } catch (Exception e) {
-                    System.err.println("Error processing line: " + line);
-                    e.printStackTrace();
+            while (!Thread.currentThread().isInterrupted()) {
+                String raw = reader.readLine();
+                if (raw == null) break;
+                long end = reader.getFilePointer();
+                // readLine returns unterminated data at EOF. Wait for LF before parsing.
+                reader.seek(end - 1);
+                if (reader.read() != '\n') break;
+                String line = new String(raw.getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
+                LogEntry entry = parser.parseLine(line);
+                if (entry != null) {
+                    System.out.println("[EVENT] " + entry);
+                    if (entry.isErrorEvent() && tracked.contains(entry.getErrorCode())) {
+                        try {
+                            dispatcher.queueAlert(new Alert(entry.getErrorCode(),
+                                    "Trade log error detected: " + entry.getMessage(), entry));
+                        } catch (IllegalStateException e) {
+                            // Retain this line's offset and retry on the next scan.
+                            System.err.println(e.getMessage() + "; retaining log offset for retry");
+                            break;
+                        }
+                    }
                 }
+                lastReadPosition = end;
             }
-
-            lastReadPosition = reader.getFilePointer();
-
-        } catch (IOException e) {
-            System.err.println("Error reading log file: " + e.getMessage());
-            // Continue monitoring despite read errors
+            prefix = new byte[(int) Math.min(lastReadPosition, 256)];
+            reader.seek(0);
+            reader.readFully(prefix);
         }
     }
 
-    /**
-     * Processes a single log line
-     */
-    private void processingLogLine(String line) {
-        // Parse the log entry
-        LogEntry entry = logParser.parseLine(line);
-
-        if (entry == null) {
-            return; // Skip unparseable lines
-        }
-
-        System.out.println("[EVENT] " + entry);
-
-        // Check if this is an error event
-        if (entry.isErrorEvent()) {
-            System.out.println("[DETECTED] " + entry);
-
-            // Check if error code is tracked
-            if (trackedErrorCodes.contains(entry.getErrorCode())) {
-                System.out.println("[ALERT] Tracked error detected: " + entry.getErrorCode());
-
-                // Create and queue alert
-                Alert alert = new Alert(
-                    entry.getErrorCode(),
-                    "Trade log error detected: " + entry.getMessage(),
-                    entry
-                );
-
-                alertDispatcher.queueAlert(alert);
-            }
-        }
-    }
-
-    /**
-     * Returns the tracked error codes
-     */
-    public Set<String> getTrackedErrorCodes() {
-        return new HashSet<>(trackedErrorCodes);
-    }
-
-    /**
-     * Checks if monitoring is running
-     */
-    public boolean isRunning() {
-        return running;
-    }
-
-    /**
-     * Gets the current file read position
-     */
-    public long getLastReadPosition() {
-        return lastReadPosition;
-    }
+    public Set<String> getTrackedErrorCodes() { return new HashSet<>(tracked); }
+    public boolean isRunning() { return running; }
+    public long getLastReadPosition() { return lastReadPosition; }
 }

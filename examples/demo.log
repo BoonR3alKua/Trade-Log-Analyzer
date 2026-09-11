@@ -1,0 +1,4 @@
+[2026-09-10 09:00:00] INFO - TRADE_STARTED: Order received
+[2026-09-10 09:00:01] WARN - LATENCY_HIGH: Response exceeded warning threshold
+[2026-09-10 09:00:02] ERROR - TRADE_REJECTED: Order validation failed
+[2026-09-10 09:00:03] FATAL - DATABASE_ERROR: Trade storage unavailable

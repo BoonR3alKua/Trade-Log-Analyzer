@@ -1,256 +1,81 @@
-import java.util.ArrayList;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Queue;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
-/**
- * Dispatches alerts in a separate thread.
- * Ensures that alert processing doesn't block log file reading.
- */
+/** Single-consumer alert delivery with bounded buffering and graceful draining. */
 public class AlertDispatcher implements Runnable {
-    private final Queue<Alert> alertQueue;
-    private final List<AlertListener> listeners;
-    private final ReentrantLock lock;
-    private volatile boolean running;
-    private Thread dispatcherThread;
-
-    // Alert listeners for subscribers
     public interface AlertListener {
         void onAlertTriggered(Alert alert);
     }
 
-    public AlertDispatcher() {
-        this.alertQueue = new LinkedList<>();
-        this.listeners = new ArrayList<>();
-        this.lock = new ReentrantLock();
-        this.running = false;
-    }
+    private final BlockingQueue<Alert> queue = new ArrayBlockingQueue<>(1024);
+    private final CopyOnWriteArrayList<AlertListener> listeners = new CopyOnWriteArrayList<>();
+    private volatile boolean running;
+    private boolean accepting;
+    private Thread worker;
 
-    /**
-     * Starts the alert dispatcher thread
-     */
     public synchronized void start() {
-        if (running) {
-            System.out.println("AlertDispatcher is already running");
-            return;
-        }
-        
+        if (worker != null) return;
+        accepting = true;
         running = true;
-        dispatcherThread = new Thread(this, "AlertDispatcher-Thread");
-        dispatcherThread.setDaemon(false);
-        dispatcherThread.start();
-        System.out.println("AlertDispatcher started");
+        worker = new Thread(this, "AlertDispatcher-Thread");
+        worker.start();
     }
 
-    /**
-     * Stops the alert dispatcher thread
-     */
-    public synchronized void stop() {
-        if (!running) {
-            System.out.println("AlertDispatcher is not running");
-            return;
+    /** Stops accepting work and waits for every accepted alert and callback. */
+    public void stop() {
+        Thread thread;
+        synchronized (this) {
+            accepting = false;
+            thread = worker;
         }
-        
-        running = false;
-        lock.lock();
-        try {
-            alertQueue.clear();
-        } finally {
-            lock.unlock();
+        if (thread == null || thread == Thread.currentThread()) return;
+        boolean interrupted = false;
+        while (thread.isAlive()) {
+            try { thread.join(); }
+            catch (InterruptedException e) { interrupted = true; }
         }
-        if (dispatcherThread != null) {
-            dispatcherThread.interrupt();
-        }
-        try {
-            if (dispatcherThread != null) {
-                dispatcherThread.join(5000); // Wait max 5 seconds
-            }
-        } catch (InterruptedException e) {
-            System.err.println("Interrupted while stopping AlertDispatcher");
-            Thread.currentThread().interrupt();
-        }
-        System.out.println("AlertDispatcher stopped");
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
-    /**
-     * Queues an alert for processing
-     */
-    public void queueAlert(Alert alert) {
-        lock.lock();
-        try {
-            alertQueue.offer(alert);
-        } finally {
-            lock.unlock();
-        }
+    /** Explicit rejection avoids silently dropping alerts or unbounded memory use. */
+    public synchronized void queueAlert(Alert alert) {
+        Objects.requireNonNull(alert, "alert");
+        if (!accepting) throw new IllegalStateException("Dispatcher is not accepting alerts");
+        if (!queue.offer(alert)) throw new IllegalStateException("Alert queue is full (1024 alerts)");
     }
 
-    /**
-     * Main dispatch loop - processes alerts from the queue
-     */
+    private synchronized boolean hasWork() { return accepting || !queue.isEmpty(); }
+
     @Override
     public void run() {
-        System.out.println("Alert Dispatcher thread started");
-        
-        while (running) {
-            Alert alert = null;
-            
-            lock.lock();
-            try {
-                alert = alertQueue.poll();
-            } finally {
-                lock.unlock();
-            }
-
-            if (alert != null) {
-                try {
-                    // Process the alert
-                    processAlert(alert);
-                    
-                    // Notify all listeners
-                    notifyListeners(alert);
-                } catch (Exception e) {
-                    System.err.println("Error processing alert: " + alert.getAlertId());
-                    e.printStackTrace();
-                }
-            } else {
-                // No alerts in queue, sleep briefly to avoid busy waiting
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException e) {
-                    System.err.println("AlertDispatcher interrupted");
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-        }
-        
-        // Process remaining alerts before shutting down
-        processPendingAlerts();
-        System.out.println("Alert Dispatcher thread stopped");
-    }
-
-    /**
-     * Processes a single alert
-     */
-    private void processAlert(Alert alert) {
-        System.out.println("\n" + separator());
-        System.out.println("PROCESSING " + alert.getSeverity() + " ALERT");
-        System.out.println(separator());
-        System.out.println(alert);
-        System.out.println(separator() + "\n");
-        
-        // Simulate alert processing 
-        simulateAlertNotification(alert);
-    }
-
-    private String separator() {
-        StringBuilder separator = new StringBuilder(80);
-        for (int index = 0; index < 80; index++) {
-            separator.append('=');
-        }
-        return separator.toString();
-    }
-
-    /**
-     * Simulates sending alert notification
-     */
-    private void simulateAlertNotification(Alert alert) {
         try {
-            // Simulate some processing time
-            Thread.sleep(500);
-            
-            System.out.println("[NOTIFICATION] Alert " + alert.getAlertId() + 
-                             " (" + alert.getSeverity() + ") dispatched");
-            
-        } catch (InterruptedException e) {
-            System.err.println("Interrupted during alert notification");
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    /**
-     * Processes any remaining alerts in the queue
-     */
-    private void processPendingAlerts() {
-        Alert alert;
-        lock.lock();
-        try {
-            while ((alert = alertQueue.poll()) != null) {
-                try {
-                    processAlert(alert);
-                } catch (Exception e) {
-                    System.err.println("Error processing pending alert: " + alert.getAlertId());
-                    e.printStackTrace();
+            while (hasWork()) {
+                Alert alert;
+                try { alert = queue.poll(100, TimeUnit.MILLISECONDS); }
+                catch (InterruptedException e) {
+                    synchronized (this) { accepting = false; }
+                    continue;
+                }
+                if (alert == null) continue;
+                System.out.println("\n" + alert);
+                for (AlertListener listener : listeners) {
+                    try { listener.onAlertTriggered(alert); }
+                    catch (Exception e) {
+                        System.err.println("Listener failed for " + alert.getAlertId() + ": " + e);
+                    }
                 }
             }
         } finally {
-            lock.unlock();
+            synchronized (this) { accepting = false; }
+            running = false;
         }
     }
 
-    /**
-     * Registers an alert listener
-     */
-    public void addListener(AlertListener listener) {
-        lock.lock();
-        try {
-            listeners.add(listener);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Removes an alert listener
-     */
-    public void removeListener(AlertListener listener) {
-        lock.lock();
-        try {
-            listeners.remove(listener);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Notifies all listeners about an alert
-     */
-    private void notifyListeners(Alert alert) {
-        List<AlertListener> listenersCopy;
-        lock.lock();
-        try {
-            listenersCopy = new ArrayList<>(listeners);
-        } finally {
-            lock.unlock();
-        }
-        
-        for (AlertListener listener : listenersCopy) {
-            try {
-                listener.onAlertTriggered(alert);
-            } catch (Exception e) {
-                System.err.println("Error notifying listener");
-                e.printStackTrace();
-            }
-        }
-    }
-
-    /**
-     * Returns the number of alerts in the queue
-     */
-    public int getQueueSize() {
-        lock.lock();
-        try {
-            return alertQueue.size();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Checks if the dispatcher is running
-     */
-    public boolean isRunning() {
-        return running;
-    }
+    public void addListener(AlertListener listener) { listeners.add(Objects.requireNonNull(listener)); }
+    public void removeListener(AlertListener listener) { listeners.remove(listener); }
+    public int getQueueSize() { return queue.size(); }
+    public boolean isRunning() { return running; }
 }
